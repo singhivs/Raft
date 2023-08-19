@@ -1,0 +1,417 @@
+#!/usr/bin/env python3
+import argparse
+import random
+import socket
+import time
+import json
+import select
+import struct
+import sys
+import math
+import os
+
+BROADCAST = "FFFF"
+start = time.time()
+
+def now():
+    return time.time() - start
+
+#nextIndex: to maintian consistency in logs and it is used for each follower 
+#problems: 
+# we are always candidate 
+# therefore we are not answering put and get requests 
+
+#TO-DO
+#implement leader restrictions in requestVote in followers (Section 5.4.1)
+#look at section 5.3 again 
+#implement section 5.4.2 again 
+# are we rpely back to the client after we append the entry to out state machine 
+class Replica:
+    def __init__(self, port, id, others):
+        self.port = port
+        self.id = id
+        self.others = others
+        
+        self.term = 0  # current election term 
+        self.state = "Follower"  # Follower, Candidate, or Leader
+        
+        self.leader_id = "FFFF"  # leader of the current term
+        self.election_timeout = random.uniform(0.3, 1) # random timeout 150–300ms
+        self.heartbeat_timeout = 0.3
+        self.replica_timeout = 0.3
+        
+        self.last_event = now()
+        self.ready = {}
+        
+        self.voted_for = None  # a candidate that we have voted for (as a follower)
+        self.votes = 0
+        # number of votes a replica needs to become a leader
+        self.majority_votes = len(self.others) / 2
+        
+        self.log = {} # index, command, term 
+        self.log_indices = []   
+        self.commit_index = 0  # index of the last message commited
+        self.last_applied = 0  # index of the most recent element added to the log
+        
+        self.next_index = [(len(self.log) + 1) for i in range(len(self.others))]  # index of the next_index[i] log entry the leader will send to that follower
+        self.match_index = [0 for i in range(len(self.others))] # index of where a follower's log matches that with the leader
+        self.is_waiting = [False for i in range(len(self.others))] 
+        self.data = {}  # "state machine" for dictionary database
+        self.queue = {}
+
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.socket.bind(("localhost", 0))
+        print("Replica %s starting up" % self.id, flush=True)
+        hello = {"src": self.id, "dst": BROADCAST, "leader": BROADCAST, "type": "hello"}
+        self.send(hello)
+        print("Sent hello message: %s" % hello, flush=True)
+
+    def send(self, message):
+        print("Sent message: %s" % message, flush=True)
+        self.socket.sendto(json.dumps(message).encode("utf-8"), ("localhost", self.port))
+
+    def begin_election(self):
+        self.state = "Candidate"
+        self.term += 1
+        self.votes += 1
+        self.voted_for = self.id
+        for id in self.others: # send RequestVote RPCs other replicas to vote for ourself
+            request_msg = {
+                "src": self.id,
+                "dst": id,
+                "leader": self.leader_id,
+                "type": "request_vote", 
+                "term": self.term,
+                "candidate_id": self.id,
+                "lastLogIndex": self.log[len(self.log)]['index'] if len(self.log) > 0 else 0,
+                'lastLogTerm':  self.log[len(self.log)]['term'] if len(self.log) > 0 else 0
+            }
+            self.send(request_msg)
+        self.last_event = now()
+
+    # process message based on the current state of us
+    def check_state(self, msg):
+        if self.state == "Leader":
+            self.leader_message(msg)
+        elif self.state == "Follower":
+            self.follower_message(msg)
+        elif self.state == "Candidate":
+            self.candidate_message(msg)
+
+     # for consistency of logs in all replicas
+    def sendRPC(self, nextIndex, replica):
+        logs_send = []
+        i = 0
+        for index in range(len(self.log)):
+            if index == 0:
+                pass
+            elif index >= nextIndex and i < 50: #send all entries after the ones the replica has already replicated in its log
+                logs_send.append(self.log[index])
+                i +=1
+        #if entries are too long then send empty 
+        if(len(logs_send) > 50):
+            logs_send = []
+        else:
+            if(nextIndex <= 1): 
+                msg = {
+                    "src": self.id,
+                    "dst": replica,
+                    "type": "append_entries",
+                    "leader": self.leader_id,
+                    "term": self.term,
+                    "lastLogIndex": self.log[nextIndex]['index'],
+                    "lastLogTerm": self.log[nextIndex]['term'],
+                    "entries": logs_send,
+                    "leaderCommit": self.commit_index
+                }
+                self.send(msg)
+            else:
+                msg = {
+                    "src": self.id,
+                    "dst": replica,
+                    "type": "append_entries",
+                    "leader": self.leader_id,
+                    "term": self.term,
+                    "lastLogIndex": self.log[nextIndex - 1]['index'],
+                    "lastLogTerm": self.log[nextIndex - 1]['term'],
+                    "entries": logs_send,
+                    "leaderCommit": self.commit_index
+                }
+                self.send(msg) 
+
+    # we are a leader
+    def leader_message(self, msg):
+        if msg["type"] == "put":  # put content into log & try committing
+            entry = {
+                "src": msg["src"],
+                "index": len(self.log) + 1,
+                "term": self.term,
+                "type": "put",
+                "key": msg["key"],
+                "value": msg["value"],
+                "MID": msg["MID"]
+            }
+            self.log_indices.append(len(self.log) + 1)  # add index to list of indices
+            self.log[len(self.log) + 1] = entry  # add entry to log
+            for i in range(len(self.others)):
+                if (self.next_index[i] >= self.match_index[i]):
+                    self.sendRPC(self.next_index[i], self.others[i])
+         
+        elif msg["type"] == "get":
+            get_msg = {
+                "src": self.id, 
+                "dst": msg["src"],
+                "leader": self.leader_id,
+                "type": "ok",
+                "MID": msg["MID"],
+                "value": self.data[msg["key"]] if msg["key"] in self.data else ""
+            }
+            self.send(get_msg)
+            
+        elif msg["type"] == "append_response":  # receive from follower
+            for id in range(len(self.others)):  # which follower sends the response
+                if msg["src"] == self.others[id]:  
+                    index_of_sender = id
+                    #self.did_replica_reply[index_of_sender] = True
+            if msg["success"]:  # follower succesfully appends to its log
+                self.next_index[index_of_sender] = msg["lastLogIndex"] + 1
+                self.match_index[index_of_sender] = msg["lastLogIndex"]
+            else:  # if fails appending
+                if (self.next_index[index_of_sender] > 1):
+                    self.next_index[index_of_sender] = self.next_index[index_of_sender] - 1
+        
+        elif msg["type"] == "append_entries": #if there is another leader go back to follower
+            if msg['term'] > self.term:
+                self.voted_for = None
+                self.leader_id = msg["leader"]
+                self.state = "Follower"
+                self.term = msg['term']
+                self.last_event = now()
+
+         
+    def commit_put(self):
+        while self.last_applied < self.commit_index:
+            self.last_applied += 1
+            key = self.log[self.last_applied]["key"] # get content from log       
+            val = self.log[self.last_applied]["value"]
+            self.data[key] = val  # commit to state
+            if self.state == "Leader":  # reply ok to put command 
+                msg = self.log[self.last_applied]
+                put_msg = {
+                    "src": self.id,
+                    "dst": msg["src"],
+                    "leader": self.id,
+                    "type": "ok",
+                    "MID": msg["MID"],
+                }
+                self.send(put_msg)
+                
+    # candidate handles vote message
+    def handle_vote(self, msg):
+        if msg["candidate_id"] == self.id: # if they voted for us 
+            self.votes += 1
+            self.voted_for = None
+            if self.votes >= self.majority_votes: # if we got enough votes to become a leader
+                self.leader_id = self.id
+                self.state = "Leader"
+                # for i in range (len(self.others)):  # reinitialize after election
+                #     self.next_index[i] = len(self.log) + 1
+                self.send_heartbeat()  # notify other replicas
+                
+    # send heartbeat to other followers
+    def send_heartbeat(self):
+        for id in self.others:
+            heartbeat_msg = {
+                "src": self.id,
+                "dst": id,
+                "type": "append_entries",
+                "leader": self.leader_id,
+                "term": self.term,
+                "lastLogIndex": self.log[len(self.log)]['index'] if len(self.log) > 0 else 0,
+                "lastLogTerm": self.log[len(self.log)]['term'] if len(self.log) > 0 else 0,
+                "entries": None,
+                "leaderCommit": self.commit_index
+            }
+            self.send(heartbeat_msg)
+        self.last_event = now()
+    
+    # we are a candidate
+    def candidate_message(self, msg):
+        if msg["type"] == "vote":  # we received a vote from follower
+            self.handle_vote(msg)
+        elif msg["type"] == "append_entries": # if receive heartbeat from another leader
+            if msg["term"] >= self.term and msg['lastLogIndex'] >= len(self.log): #recognises the leader is legitimate
+                self.voted_for = None
+                self.leader_id = msg["leader"]
+                self.state = "Follower"
+                self.term = msg['term']
+                self.last_event = now()
+        
+    # we are a follower
+    def follower_message(self, msg):
+        if msg["type"] == "request_vote":  # vote for a candidate
+            vote_msg = {
+                "src": self.id,
+                "dst": msg["src"],
+                "leader": self.leader_id,
+                "type": "vote",
+                 "candidate_id": msg["candidate_id"]
+                }
+            if msg["term"] >= self.term and (self.voted_for == None or self.voted_for == msg["candidate_id"]):  # in correct term & able to vote
+                if len(self.log) == 0: #if we dont have anything in the log vote for the candidate  
+                    self.term = msg['term']
+                    self.send(vote_msg) # send back vote message to candidate
+                    self.voted_for = msg["candidate_id"]
+                    self.last_event = now()
+                if len(self.log) > 0: 
+                    if msg["lastLogTerm"] == self.log[len(self.log)]['term'] and msg['lastLogIndex'] >= len(self.log): # if candidate's log is at least up-to-date as the follower
+                        self.term = msg['term']
+                        self.send(vote_msg) # send back vote message to candidate
+                        self.voted_for = msg["candidate_id"]
+                        self.last_event = now()
+                    elif msg["lastLogTerm"] > self.log[len(self.log)]['term']:
+                        self.term = msg['term']
+                        self.send(vote_msg) # send back vote message to candidate
+                        self.voted_for = msg["candidate_id"]
+                        self.last_event = now()
+                    
+        elif msg["type"] == "append_entries":  # receive heartbeat/append message from a leader
+            self.voted_for = None
+            self.last_event = now()
+                
+            if msg["leader"] == self.leader_id and msg["entries"] != None:  # if receive actual append and not a heartbeat
+                self.last_event = now()
+                fail_msg = {  # send fail message
+                        "src": self.id,
+                        "dst": msg["src"],
+                        "leader": self.leader_id,
+                        "type": "append_response",
+                        "success": False
+                }
+                    
+                if msg["term"] < self.term: # if follower does not contain every matching entry
+                    self.send(fail_msg)
+               
+                elif msg['lastLogIndex'] in list(self.log.keys()):
+                    if self.log[msg["lastLogIndex"]]["term"] != msg["lastLogTerm"]:
+                        self.send(fail_msg)
+                    else:
+                        for entry in msg["entries"]:
+                            keys = list(self.log.keys())
+                            if entry["index"] in keys:
+                                entry_in_log = self.log[entry["index"]]
+                                if(entry_in_log['term'] != entry['term']):  # delete all log entries from that index until the end
+                                    length_of_log = len(self.log) + 1
+                                    for i in range(entry_in_log['index'], length_of_log):
+                                        del self.log[i]
+                                    break
+                            
+                        for entry in msg["entries"]:            
+                            if(entry['index'] not in keys):
+                                self.log[entry["index"]] = entry
+                        
+                        if(msg['leaderCommit'] > self.commit_index):
+                            self.commit_index = min(msg['leaderCommit'], len(self.log))
+                            
+                        success_msg = {
+                            "src": self.id,
+                            "dst": msg["src"],
+                            "leader": self.leader_id,
+                            "type": "append_response",
+                            "success": True,
+                            "lastLogIndex": len(self.log)
+                        }
+                        self.send(success_msg)
+                        if self.commit_index > 0:
+                            self.commit_put()
+                else:
+                    for entry in msg["entries"]:
+                        keys = list(self.log.keys())
+                        if entry["index"] in keys:
+                            entry_in_log = self.log[entry["index"]]
+                            if(entry_in_log['term'] != entry['term']):  # delete all log entries from that index until the end
+                                length_of_log = len(self.log) + 1
+                                for i in range(entry_in_log['index'], length_of_log):
+                                    del self.log[i]
+                                    
+                        if(entry['index'] not in keys):
+                            self.log[entry["index"]] = entry
+                    
+                    if(msg['leaderCommit'] > self.commit_index):
+                        self.commit_index = min(msg['leaderCommit'], len(self.log))
+                        
+                    success_msg = {
+                        "src": self.id,
+                        "dst": msg["src"],
+                        "leader": self.leader_id,
+                        "type": "append_response",
+                        "success": True,
+                        "lastLogIndex": len(self.log)
+                    }
+                    self.send(success_msg)
+                    self.term = msg['term']
+                    if self.commit_index > 0:
+                        self.commit_put()
+                
+            elif msg["entries"] == None: # received a heartbeat
+                self.leader_id = msg["leader"]
+                self.term = msg['term']              
+                
+        elif msg["type"] == "get" or msg["type"] == "put":  # redirect 
+            redirect_msg = {
+                "src": self.id,
+                "dst": msg["src"],
+                "type": "redirect",
+                "leader": self.leader_id,
+                "MID": msg["MID"]
+            }
+            self.send(redirect_msg)
+
+
+    def run(self):
+        while True:
+            socks = select.select([self.socket], [], [], 0.1)[0]
+            
+            if self.socket in socks:
+                data, addr = self.socket.recvfrom(65535)
+                msg = json.loads(data.decode("utf-8"))
+                
+                if (msg["type"] == "put") and self.leader_id == "FFFF":
+                    self.queue[len(self.log) + 1] = msg
+                
+                self.check_state(msg) # check the current state of oursleves
+   
+            if self.state == "Follower":
+                if self.election_timeout < now() - self.last_event:
+                    self.voted_for = None
+                    self.begin_election()
+                        
+            if self.state == "Leader":  # ensuring valid leader state, stay alive
+                if self.heartbeat_timeout < now() - self.last_event:
+                    self.send_heartbeat()
+
+                for match in self.match_index:
+                    if match > self.commit_index:
+                        commit = 0
+                        for replica in self.match_index:
+                            if replica >= match:
+                               commit += 1
+                        if commit >= len(self.others) / 2:
+                            self.commit_index = match
+
+                            if(self.commit_index > 0):
+                                self.commit_put()
+                                break
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="run a key-value store")
+    parser.add_argument("port", type=int, help="Port number to communicate")
+    parser.add_argument("id", type=str, help="ID of this replica")
+    parser.add_argument("others", metavar="others", type=str, nargs="+", help="IDs of other replicas")
+    args = parser.parse_args()
+    replica = Replica(args.port, args.id, args.others)
+    try: 
+        replica.run()
+    except Exception as err: 
+        print(err, flush=True)
+        sys.exit(1)
